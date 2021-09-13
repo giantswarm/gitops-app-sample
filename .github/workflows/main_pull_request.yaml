@@ -1,0 +1,152 @@
+on: 
+  push:
+    branches:
+    - main
+    - master
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    name: Build and push container image
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Build Image
+      id: build-image
+      uses: redhat-actions/buildah-build@v2
+      with:
+        image: gitops-app-sample
+        tags: latest ${{ github.sha }}
+        dockerfiles: |
+          ./Dockerfile
+
+    - name: Push To quay.io
+      id: push-to-quay
+      uses: redhat-actions/push-to-registry@v2
+      with:
+        image: ${{ steps.build-image.outputs.image }}
+        tags: ${{ steps.build-image.outputs.tags }}
+        registry: quay.io/giantswarm
+        username: ${{ secrets.REGISTRY_USERNAME }}
+        password: ${{ secrets.REGISTRY_PASSWORD }}
+
+    - name: Print image url
+      run: echo "Image pushed to ${{ steps.push-to-quay.outputs.registry-paths }}"
+
+  deploy:
+    name: Update GipOps repo to deploy the chart
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          repository: giantswarm/flux-poc
+          fetch-depth: 0
+          persist-credentials: false
+
+      ## TODO create GitRepository CR
+
+      - name: Update gitops repo
+        run: |
+          DIRECTORY=./manifests/dev
+          if [ ! -f "$DIRECTORY" ]; then
+            mkdir -p $DIRECTORY
+          fi
+
+          FILE=$DIRECTORY/${{ github.event.repository.name }}.yaml
+          cat <<EOT > $FILE
+          apiVersion: helm.toolkit.fluxcd.io/v2beta1
+          kind: HelmRelease
+          metadata:
+            name: gitops-app-sample-dev
+            namespace: flux-app-dev
+          spec:
+            releaseName: gitops-app-sample-dev
+            chart:
+              spec:
+                chart: ./helm
+                sourceRef:
+                  kind: GitRepository
+                  name: gitops-app-sample
+                  namespace: flux-app
+                valuesFiles:
+                - ./helm/values.yaml
+                - ./helm/values-dev.yaml
+            values:
+              image:
+                tag: "${{ github.sha }}"
+            interval: 1m
+          EOT
+
+          DIRECTORY=./manifests/staging
+          if [ ! -f "$DIRECTORY" ]; then
+            mkdir -p $DIRECTORY
+          fi
+
+          FILE=$DIRECTORY/${{ github.event.repository.name }}.yaml
+          cat <<EOT > $FILE
+          apiVersion: helm.toolkit.fluxcd.io/v2beta1
+          kind: HelmRelease
+          metadata:
+            name: ${{ github.event.repository.name }}-staging
+            namespace: flux-app-staging
+          spec:
+            releaseName: ${{ github.event.repository.name }}-staging
+            chart:
+              spec:
+                chart: ./helm
+                sourceRef:
+                  kind: GitRepository
+                  name: ${{ github.event.repository.name }}
+                  namespace: flux-app
+                valuesFiles:
+                - ./helm/values.yaml
+                - ./helm/values-staging.yaml
+            values:
+              image:
+                tag: "${{ github.sha }}"
+            interval: 1m
+          EOT
+
+          DIRECTORY=./manifests/production
+          if [ ! -f "$DIRECTORY" ]; then
+            mkdir -p $DIRECTORY
+          fi
+
+          FILE=$DIRECTORY/${{ github.event.repository.name }}.yaml
+          cat <<EOT > $FILE
+          apiVersion: helm.toolkit.fluxcd.io/v2beta1
+          kind: HelmRelease
+          metadata:
+            name: ${{ github.event.repository.name }}-production
+            namespace: flux-app-production
+          spec:
+            releaseName: ${{ github.event.repository.name }}-production
+            chart:
+              spec:
+                chart: ./helm
+                sourceRef:
+                  kind: GitRepository
+                  name: ${{ github.event.repository.name }}
+                  namespace: flux-app
+                valuesFiles:
+                - ./helm/values.yaml
+                - ./helm/values-production.yaml
+            values:
+              image:
+                tag: "${{ github.sha }}"
+            interval: 1m
+          EOT
+
+      - name: Commit files
+        run: |
+          git config --local user.name " ${{ github.actor }}"
+          git add ./manifests
+          git commit -m "Updating application ${{ github.event.repository.name }} to ${{ github.sha }}"
+
+      - name: Push changes
+        uses: ad-m/github-push-action@master
+        with:
+          github_token: ${{ secrets.BOT_GITHUB_TOKEN }}
+          repository: giantswarm/flux-poc
